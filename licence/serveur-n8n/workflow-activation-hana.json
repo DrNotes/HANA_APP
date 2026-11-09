@@ -1,0 +1,369 @@
+{
+  "name": "HANA - Activation de licence",
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "Webhook activation",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "hana-activate",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hana/activate",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "n2",
+      "name": "Valider entrée",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Normalise et valide l'entrée (évite toute donnée bizarre vers la base)\nconst body = $input.first().json.body || {};\nconst key = String(body.key || '').trim().toUpperCase();\nconst machineId = String(body.machineId || '').trim().toLowerCase();\nconst appVersion = String(body.appVersion || '').trim();\n\nconst valid = /^[A-Z0-9-]{4,64}$/.test(key)\n  && /^[a-f0-9]{64}$/.test(machineId)\n  && /^[\\w.\\-]{0,20}$/.test(appVersion);\n\nreturn [{ json: { valid, key: valid ? key : 'INVALIDE', machineId: valid ? machineId : '0', appVersion } }];"
+      }
+    },
+    {
+      "id": "n3",
+      "name": "Chercher licence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        0
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REMPLACER",
+          "name": "Postgres HANA"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT l.key, l.plan, l.max_machines, l.expires_at, l.revoked,\n  (SELECT count(*) FROM activations a WHERE a.licence_key = l.key) AS nb_activations,\n  EXISTS (SELECT 1 FROM activations a WHERE a.licence_key = l.key AND a.machine_id = $2) AS deja_active\nFROM licences l\nWHERE l.key = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.key }},{{ $json.machineId }}"
+        }
+      }
+    },
+    {
+      "id": "n4",
+      "name": "Décider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Décide si l'activation est autorisée\nconst input = $('Valider entrée').first().json;\nconst row = $input.first().json || {};\n\nconst refus = (code, message) => [{ json: { ok: false, code, message } }];\n\nif (!input.valid) return refus(400, 'Requête invalide');\nif (!row.key) return refus(404, 'Clé de licence inconnue');\nif (row.revoked) return refus(403, 'Licence révoquée');\nif (row.expires_at && new Date(row.expires_at) < new Date()) return refus(403, 'Licence expirée');\nif (!row.deja_active && Number(row.nb_activations) >= Number(row.max_machines)) {\n  return refus(403, `Nombre maximum de Mac atteint (${row.max_machines}). Désactivez un autre Mac.`);\n}\n\nreturn [{ json: {\n  ok: true,\n  key: row.key,\n  machineId: input.machineId,\n  appVersion: input.appVersion,\n  plan: row.plan,\n  expiresAt: row.expires_at ? Math.floor(new Date(row.expires_at).getTime() / 1000) : null,\n} }];"
+      }
+    },
+    {
+      "id": "n5",
+      "name": "Autorisé ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n6",
+      "name": "Enregistrer activation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        -100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REMPLACER",
+          "name": "Postgres HANA"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activations (licence_key, machine_id, app_version)\nVALUES ($1, $2, $3)\nON CONFLICT (licence_key, machine_id)\nDO UPDATE SET last_seen = now(), app_version = EXCLUDED.app_version\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.key }},{{ $json.machineId }},{{ $json.appVersion }}"
+        }
+      }
+    },
+    {
+      "id": "n7",
+      "name": "Signer licence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "// Signe la licence avec la clé privée Ed25519\n// Prérequis n8n : NODE_FUNCTION_ALLOW_BUILTIN=crypto et la variable HANA_LICENCE_PRIVATE_KEY\nconst crypto = require('crypto');\nconst d = $('Décider').first().json;\n\nconst now = Math.floor(Date.now() / 1000);\nconst JOURS_HORS_LIGNE = 30; // durée pendant laquelle l'app fonctionne sans revalider\nlet validUntil = now + JOURS_HORS_LIGNE * 86400;\nif (d.expiresAt) validUntil = Math.min(validUntil, d.expiresAt);\n\nconst payload = {\n  key: d.key,\n  machineId: d.machineId,\n  plan: d.plan,\n  expiresAt: d.expiresAt,\n  issuedAt: now,\n  validUntil,\n};\n\nconst pem = $env.HANA_LICENCE_PRIVATE_KEY.replace(/\\\\n/g, '\\n');\nconst payloadBuf = Buffer.from(JSON.stringify(payload), 'utf8');\nconst signature = crypto.sign(null, payloadBuf, crypto.createPrivateKey(pem));\n\nreturn [{ json: {\n  payload: payloadBuf.toString('base64'),   // signé tel quel : ne jamais le reformater\n  signature: signature.toString('base64'),\n} }];"
+      }
+    },
+    {
+      "id": "n8",
+      "name": "Répondre OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1540,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "n9",
+      "name": "Répondre refus",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: $json.message } }}",
+        "options": {
+          "responseCode": "={{ $json.code }}"
+        }
+      }
+    },
+    {
+      "id": "d1",
+      "name": "Webhook désactivation",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        400
+      ],
+      "webhookId": "hana-deactivate",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hana/deactivate",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "d2",
+      "name": "Valider entrée (désactivation)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        400
+      ],
+      "parameters": {
+        "jsCode": "// Normalise et valide l'entrée (évite toute donnée bizarre vers la base)\nconst body = $input.first().json.body || {};\nconst key = String(body.key || '').trim().toUpperCase();\nconst machineId = String(body.machineId || '').trim().toLowerCase();\nconst appVersion = String(body.appVersion || '').trim();\n\nconst valid = /^[A-Z0-9-]{4,64}$/.test(key)\n  && /^[a-f0-9]{64}$/.test(machineId)\n  && /^[\\w.\\-]{0,20}$/.test(appVersion);\n\nreturn [{ json: { valid, key: valid ? key : 'INVALIDE', machineId: valid ? machineId : '0', appVersion } }];"
+      }
+    },
+    {
+      "id": "d3",
+      "name": "Supprimer activation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        400
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REMPLACER",
+          "name": "Postgres HANA"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM activations WHERE licence_key = $1 AND machine_id = $2 RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.key }},{{ $json.machineId }}"
+        }
+      }
+    },
+    {
+      "id": "d4",
+      "name": "Répondre désactivé",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        400
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook activation": {
+      "main": [
+        [
+          {
+            "node": "Valider entrée",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valider entrée": {
+      "main": [
+        [
+          {
+            "node": "Chercher licence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chercher licence": {
+      "main": [
+        [
+          {
+            "node": "Décider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Décider": {
+      "main": [
+        [
+          {
+            "node": "Autorisé ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Autorisé ?": {
+      "main": [
+        [
+          {
+            "node": "Enregistrer activation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Répondre refus",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enregistrer activation": {
+      "main": [
+        [
+          {
+            "node": "Signer licence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signer licence": {
+      "main": [
+        [
+          {
+            "node": "Répondre OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook désactivation": {
+      "main": [
+        [
+          {
+            "node": "Valider entrée (désactivation)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valider entrée (désactivation)": {
+      "main": [
+        [
+          {
+            "node": "Supprimer activation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supprimer activation": {
+      "main": [
+        [
+          {
+            "node": "Répondre désactivé",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
